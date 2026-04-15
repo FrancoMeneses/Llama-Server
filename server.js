@@ -3,72 +3,106 @@ import fs from "fs";
 import fetch from "node-fetch";
 import { execSync } from "child_process";
 import dotenv from "dotenv";
+import TelegramBot from "node-telegram-bot-api";
 
 dotenv.config();
 
 const app = express();
 app.use(express.json());
 
-const DRY_RUN = true;
+const DRY_RUN = process.env.DRY_RUN === "true";
 
 /**
- * 1. LOAD TASKS FROM MD
+ * =========================
+ * TELEGRAM BOT
+ * =========================
+ */
+const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, {
+  polling: true
+});
+
+/**
+ * =========================
+ * LOAD TASKS
+ * =========================
  */
 const loadTasks = () => {
-  const content = fs.readFileSync(process.env.PLAN_PATH, "utf-8");
+  try {
+    const content = fs.readFileSync(process.env.PLAN_PATH, "utf-8");
 
-  return content
-    .split("\n")
-    .filter(l => l.startsWith("- "))
-    .map(l => l.replace("- ", "").trim());
+    return content
+      .split("\n")
+      .filter(l => l.startsWith("- "))
+      .map(l => l.replace("- ", "").trim());
+  } catch {
+    return [];
+  }
 };
 
 /**
- * 2. REPO CONTEXT (MINIMAL Y ESTABLE)
+ * =========================
+ * CONTEXT
+ * =========================
  */
-const getRepoContext = () => {
+const getContext = () => {
   let gitStatus = "";
 
   try {
     gitStatus = execSync("git status --porcelain").toString();
-  } catch (e) {
+  } catch {
     gitStatus = "no git repo";
   }
 
   return `
 WORKDIR: ${process.cwd()}
-GIT_STATUS:
+GIT:
 ${gitStatus || "clean"}
 `;
 };
 
 /**
- * 3. CALL LLM (llama.cpp SAFE VERSION)
+ * =========================
+ * LLM CALL (HYBRID CHAT + TOOLS)
+ * =========================
  */
-const callLLM = async (task, context) => {
+const callLLM = async (input, context) => {
   const prompt = `
-You are a strict execution orchestrator.
+You are a hybrid assistant.
 
-Return ONLY valid JSON. No markdown. No explanation.
+You can either:
+1. Chat normally
+2. Or use tools when needed
 
-TASK:
-${task}
+TOOLS AVAILABLE:
+- shell
+- claude
+- codex
+- db_query
+- telegram_send
+
+Return ONLY valid JSON.
+
+FORMAT:
+{
+  "type": "chat" | "tool",
+  "message": "string",
+  "tool": {
+    "name": "shell | claude | codex | db_query | telegram_send",
+    "input": "string"
+  } | null
+}
+
+RULES:
+- If no action needed → type chat
+- If action needed → type tool
+- No markdown
+- No explanation
+
+INPUT:
+${input}
 
 CONTEXT:
 ${context}
-
-RULES:
-- choose tool: "claude" | "codex" | "shell"
-- instruction must be executable
-- no questions
-- no extra keys
-
-OUTPUT FORMAT:
-{
-  "tool": "claude",
-  "instruction": "string",
-  "done": true
-}
 `;
 
   try {
@@ -77,18 +111,15 @@ OUTPUT FORMAT:
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         prompt,
-        temperature: 0.2,
-        stop: ["```"]
+        temperature: 0.2
       })
     });
 
     const data = await res.json();
-
     const text = data.content || data.response || "";
 
-    console.log("\n🧠 RAW LLM OUTPUT:\n", text);
+    console.log("\n🧠 RAW LLM:\n", text);
 
-    // SAFE JSON PARSE
     const cleaned = text
       .replace(/```json/g, "")
       .replace(/```/g, "")
@@ -96,131 +127,148 @@ OUTPUT FORMAT:
 
     return JSON.parse(cleaned);
   } catch (err) {
-    console.log("❌ LLM ERROR OR INVALID JSON:", err.message);
-
     return {
-      tool: "shell",
-      instruction: "echo 'LLM FAILED'",
-      done: true
+      type: "chat",
+      message: "LLM error or invalid response",
+      tool: null
     };
   }
 };
 
 /**
- * 4. EXECUTORS
+ * =========================
+ * TOOL EXECUTOR
+ * =========================
  */
-const runClaude = (instruction) => {
-  console.log("▶ CLAUDE:", instruction);
+const executeTool = async (tool, chatId) => {
+  const { name, input } = tool;
 
-  if (DRY_RUN) return console.log("[DRY RUN] Claude skipped");
+  console.log("🛠 TOOL:", name, input);
 
-  execSync(`claude "${instruction}"`, { stdio: "inherit" });
-};
-
-const runCodex = (instruction) => {
-  console.log("▶ CODEX:", instruction);
-
-  if (DRY_RUN) return console.log("[DRY RUN] Codex skipped");
-
-  execSync(`codex "${instruction}"`, { stdio: "inherit" });
-};
-
-const runShell = (instruction) => {
-  console.log("▶ SHELL:", instruction);
-
-  if (DRY_RUN) return console.log("[DRY RUN] Shell skipped");
-
-  execSync(instruction, { stdio: "inherit" });
-};
-
-/**
- * 5. GIT SYNC
- */
-const gitCommit = (task) => {
-  if (DRY_RUN) return console.log("[DRY RUN] git skipped");
+  let output = "";
 
   try {
-    execSync("git add .");
-    execSync(`git commit -m "task: ${task}"`);
-    execSync("git push");
-  } catch (e) {
-    console.log("⚠️ Git error:", e.message);
+    if (name === "shell") {
+      if (DRY_RUN) return output = "[DRY RUN] shell skipped";
+      output = execSync(input).toString();
+    }
+
+    if (name === "claude") {
+      if (DRY_RUN) return output = "[DRY RUN] claude skipped";
+      execSync(`claude "${input}"`, { stdio: "inherit" });
+      output = "claude executed";
+    }
+
+    if (name === "codex") {
+      if (DRY_RUN) return output = "[DRY RUN] codex skipped";
+      execSync(`codex "${input}"`, { stdio: "inherit" });
+      output = "codex executed";
+    }
+
+    if (name === "db_query") {
+      output = `DB placeholder: ${input}`;
+    }
+
+    if (name === "telegram_send") {
+      if (chatId) {
+        bot.sendMessage(chatId, input);
+      }
+      output = "sent to telegram";
+    }
+  } catch (err) {
+    output = `error: ${err.message}`;
+  }
+
+  return output;
+};
+
+/**
+ * =========================
+ * DISPATCHER
+ * =========================
+ */
+const handleLLMResponse = async (res, chatId) => {
+  if (!res) return;
+
+  if (res.type === "chat") {
+    if (chatId) bot.sendMessage(chatId, res.message);
+    return;
+  }
+
+  if (res.type === "tool") {
+    const output = await executeTool(res.tool, chatId);
+
+    if (chatId) {
+      bot.sendMessage(chatId, `🛠 ${res.tool.name}:\n\n${output}`);
+    }
   }
 };
 
 /**
- * 6. PIPELINE CORE (ORQUESTADOR REAL)
+ * =========================
+ * PIPELINE (PLAN MODE)
+ * =========================
  */
-const runPipeline = async () => {
+const runPipeline = async (chatId = null) => {
   const tasks = loadTasks();
 
-  console.log("\n🚀 TASKS LOADED:", tasks.length);
+  console.log("\n🚀 TASKS:", tasks.length);
 
   for (const task of tasks) {
-    console.log("\n======================");
-    console.log("📌 TASK:", task);
+    console.log("\n📌 TASK:", task);
 
-    const context = getRepoContext();
+    const context = getContext();
 
-    const plan = await callLLM(task, context);
+    const res = await callLLM(task, context);
 
-    console.log("🧩 PLAN:", plan);
-
-    if (!plan || !plan.tool || !plan.instruction) {
-      console.log("❌ INVALID PLAN, SKIPPING");
-      continue;
-    }
-
-    try {
-      if (plan.tool === "claude") {
-        runClaude(plan.instruction);
-      }
-
-      if (plan.tool === "codex") {
-        runCodex(plan.instruction);
-      }
-
-      if (plan.tool === "shell") {
-        runShell(plan.instruction);
-      }
-
-      gitCommit(task);
-
-      if (!plan.done) {
-        console.log("⛔ STOP FLAG RECEIVED");
-        break;
-      }
-    } catch (err) {
-      console.log("❌ EXECUTION ERROR:", err.message);
-      break;
-    }
+    await handleLLMResponse(res, chatId);
   }
 
-  console.log("\n✅ PIPELINE FINISHED");
+  console.log("\n✅ PIPELINE DONE");
 };
 
 /**
- * 7. API TRIGGERS
+ * =========================
+ * TELEGRAM ENTRYPOINT
+ * =========================
+ */
+bot.on("message", async (msg) => {
+  const chatId = msg.chat.id;
+  const text = msg.text;
+
+  console.log("📩 Telegram:", text);
+
+  if (text === "/run") {
+    runPipeline(chatId);
+    return;
+  }
+
+  const context = getContext();
+  const res = await callLLM(text, context);
+
+  await handleLLMResponse(res, chatId);
+});
+
+/**
+ * =========================
+ * EXPRESS API
+ * =========================
  */
 app.post("/run", async (req, res) => {
   runPipeline();
   res.json({ status: "started" });
 });
 
-app.post("/dry-run", async (req, res) => {
-  console.log("🧪 DRY RUN MODE");
-  runPipeline();
-  res.json({ status: "dry-running" });
-});
-
 app.get("/", (req, res) => {
-  res.send("🚀 Orchestrator alive");
+  res.send("🚀 Hybrid Agent Running");
 });
 
 /**
- * 8. START SERVER
+ * =========================
+ * START
+ * =========================
  */
 app.listen(3000, () => {
-  console.log("🚀 Orchestrator running on port 3000");
+  console.log("🚀 Server running on 3000");
   console.log("DRY_RUN =", DRY_RUN);
 });
