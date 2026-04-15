@@ -25,7 +25,21 @@ const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, {
 
 /**
  * =========================
- * CONTEXT (LIGERO)
+ * SAFE SEND (ANTI CRASH)
+ * =========================
+ */
+const safeSend = async (chatId, text) => {
+  try {
+    if (!text) return;
+    await bot.sendMessage(chatId, text);
+  } catch (err) {
+    console.log("❌ TELEGRAM ERROR:", err.message);
+  }
+};
+
+/**
+ * =========================
+ * CONTEXT
  * =========================
  */
 const getContext = () => `
@@ -163,7 +177,7 @@ const runTool = async (tool, chatId) => {
     }
 
     if (name === "telegram_send") {
-      if (chatId) await bot.sendMessage(chatId, input);
+      if (chatId) await safeSend(chatId, input);
       return "sent";
     }
 
@@ -183,14 +197,14 @@ const handleResponse = async (res, chatId) => {
   if (!res) return;
 
   if (res.type === "chat") {
-    await bot.sendMessage(chatId, res.message);
+    await safeSend(chatId, res.message);
     return;
   }
 
   if (res.type === "tool") {
     const output = await runTool(res.tool, chatId);
 
-    await bot.sendMessage(
+    await safeSend(
       chatId,
       `🛠 ${res.tool.name}:\n\n${output}`
     );
@@ -199,26 +213,34 @@ const handleResponse = async (res, chatId) => {
 
 /**
  * =========================
- * TELEGRAM ENTRY (SIN ROUTER)
+ * TELEGRAM ENTRY (LOCK)
  * =========================
  */
-bot.on("message", async (msg) => {
-  const chatId = msg.chat.id;
-  const text = msg.text;
+let processing = false;
 
-  console.log("📩", text);
+bot.on("message", async (msg) => {
+  if (processing) return;
+
+  processing = true;
 
   try {
-    const context = getContext();
+    const chatId = msg.chat.id;
+    const text = msg.text;
 
+    if (!text) return;
+
+    console.log("📩", text);
+
+    const context = getContext();
     const res = await callLLM(text, context);
 
     await handleResponse(res, chatId);
 
   } catch (err) {
     console.log("ERROR:", err.message);
-    await bot.sendMessage(chatId, "Error interno");
   }
+
+  processing = false;
 });
 
 /**
