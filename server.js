@@ -1,14 +1,16 @@
 import express from "express";
-import fs from "fs";
 import fetch from "node-fetch";
-import { execSync } from "child_process";
+import { exec } from "child_process";
 import dotenv from "dotenv";
 import TelegramBot from "node-telegram-bot-api";
+import { promisify } from "util";
 
 dotenv.config();
 
 const app = express();
 app.use(express.json());
+
+const execAsync = promisify(exec);
 
 const DRY_RUN = process.env.DRY_RUN === "true";
 
@@ -23,28 +25,18 @@ const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, {
 
 /**
  * =========================
- * CONTEXT (ligero)
+ * CONTEXT (ULTRA LIGHT)
  * =========================
  */
 const getContext = () => {
-  let gitStatus = "";
-
-  try {
-    gitStatus = execSync("git status --porcelain").toString();
-  } catch {
-    gitStatus = "no git repo";
-  }
-
   return `
 WORKDIR: ${process.cwd()}
-GIT:
-${gitStatus || "clean"}
 `;
 };
 
 /**
  * =========================
- * SAFE JSON PARSE
+ * SAFE JSON EXTRACTOR
  * =========================
  */
 const extractJSON = (text) => {
@@ -61,34 +53,31 @@ const extractJSON = (text) => {
 
 /**
  * =========================
- * ROUTER LLM (INTENT CLASSIFIER)
+ * ROUTER (INTENT CLASSIFIER)
  * =========================
  */
 const routeLLM = async (input) => {
   const prompt = `
-Classify user intent.
+Classify intent.
 
-Return ONLY JSON.
+Return ONLY JSON:
 
-INTENTS:
-- chat (normal conversation)
-- plan (user wants tasks or planning)
-- tool (needs execution or repo action)
-
-INPUT:
-${input}
-
-OUTPUT:
 {
   "intent": "chat | plan | tool"
 }
+
+INPUT:
+${input}
 `;
 
   try {
     const res = await fetch(process.env.LLM_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt, temperature: 0.1 })
+      body: JSON.stringify({
+        prompt,
+        temperature: 0.1
+      })
     });
 
     const data = await res.json();
@@ -104,24 +93,12 @@ OUTPUT:
 
 /**
  * =========================
- * MAIN LLM (CHAT / PLAN / TOOL)
+ * MAIN LLM
  * =========================
  */
 const callLLM = async (input, context) => {
   const prompt = `
 You are a hybrid assistant.
-
-You may:
-- chat normally
-- generate plans (only if asked)
-- suggest tool usage
-
-TOOLS:
-- shell
-- claude
-- codex
-- db_query
-- telegram_send
 
 Return ONLY JSON.
 
@@ -146,7 +123,10 @@ ${context}
     const res = await fetch(process.env.LLM_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt, temperature: 0.2 })
+      body: JSON.stringify({
+        prompt,
+        temperature: 0.2
+      })
     });
 
     const data = await res.json();
@@ -157,7 +137,7 @@ ${context}
     if (!parsed) {
       return {
         type: "chat",
-        message: text || "No valid response",
+        message: text || "no valid response",
         tool: null
       };
     }
@@ -174,45 +154,52 @@ ${context}
 
 /**
  * =========================
- * TOOL EXECUTOR
+ * TOOL EXECUTOR (ASYNC SAFE)
  * =========================
  */
 const runTool = async (tool, chatId) => {
   const { name, input } = tool;
 
-  let output = "";
-
   try {
     if (name === "shell") {
       if (DRY_RUN) return "[DRY RUN] shell skipped";
-      output = execSync(input).toString();
+
+      const { stdout } = await execAsync(input, {
+        timeout: 10000
+      });
+
+      return stdout;
     }
 
     if (name === "claude") {
       if (DRY_RUN) return "[DRY RUN] claude skipped";
-      execSync(`claude "${input}"`, { stdio: "inherit" });
-      output = "claude executed";
+
+      await execAsync(`claude "${input}"`);
+      return "claude executed";
     }
 
     if (name === "codex") {
       if (DRY_RUN) return "[DRY RUN] codex skipped";
-      execSync(`codex "${input}"`, { stdio: "inherit" });
-      output = "codex executed";
+
+      await execAsync(`codex "${input}"`);
+      return "codex executed";
     }
 
     if (name === "db_query") {
-      output = `DB MOCK: ${input}`;
+      return `DB MOCK: ${input}`;
     }
 
     if (name === "telegram_send") {
-      if (chatId) bot.sendMessage(chatId, input);
-      output = "sent to telegram";
+      if (chatId) {
+        await bot.sendMessage(chatId, input);
+      }
+      return "sent to telegram";
     }
-  } catch (err) {
-    output = `error: ${err.message}`;
-  }
 
-  return output;
+    return "unknown tool";
+  } catch (err) {
+    return `tool error: ${err.message}`;
+  }
 };
 
 /**
@@ -224,7 +211,9 @@ const handleResponse = async (res, chatId) => {
   if (!res) return;
 
   if (res.type === "chat") {
-    if (chatId) bot.sendMessage(chatId, res.message);
+    if (chatId) {
+      await bot.sendMessage(chatId, res.message);
+    }
     return;
   }
 
@@ -232,14 +221,17 @@ const handleResponse = async (res, chatId) => {
     const output = await runTool(res.tool, chatId);
 
     if (chatId) {
-      bot.sendMessage(chatId, `🛠 ${res.tool.name}:\n\n${output}`);
+      await bot.sendMessage(
+        chatId,
+        `🛠 ${res.tool.name}:\n\n${output}`
+      );
     }
   }
 };
 
 /**
  * =========================
- * TELEGRAM ENTRY
+ * TELEGRAM ENTRYPOINT
  * =========================
  */
 bot.on("message", async (msg) => {
@@ -248,28 +240,38 @@ bot.on("message", async (msg) => {
 
   console.log("📩", text);
 
-  const route = await routeLLM(text);
+  try {
+    const route = await routeLLM(text);
 
-  console.log("🧭 ROUTE:", route);
+    console.log("🧭 ROUTE:", route);
 
-  const context = getContext();
+    const context = getContext();
 
-  if (route.intent === "chat") {
-    const res = await callLLM(text, "chat mode");
-    return handleResponse(res, chatId);
-  }
+    if (route.intent === "chat") {
+      const res = await callLLM(text, "chat mode");
+      return await handleResponse(res, chatId);
+    }
 
-  if (route.intent === "plan") {
-    const res = await callLLM(
-      "Generate structured plan ONLY if needed: " + text,
-      context
+    if (route.intent === "plan") {
+      const res = await callLLM(
+        "Generate plan only if explicitly needed: " + text,
+        context
+      );
+      return await handleResponse(res, chatId);
+    }
+
+    if (route.intent === "tool") {
+      const res = await callLLM(text, context);
+      return await handleResponse(res, chatId);
+    }
+
+  } catch (err) {
+    console.log("ERROR:", err.message);
+
+    await bot.sendMessage(
+      chatId,
+      "Error procesando solicitud"
     );
-    return handleResponse(res, chatId);
-  }
-
-  if (route.intent === "tool") {
-    const res = await callLLM(text, context);
-    return handleResponse(res, chatId);
   }
 });
 
@@ -279,12 +281,12 @@ bot.on("message", async (msg) => {
  * =========================
  */
 app.post("/run", async (req, res) => {
-  const result = await callLLM("run pipeline", getContext());
+  const result = await callLLM("run", getContext());
   res.json(result);
 });
 
 app.get("/", (req, res) => {
-  res.send("🚀 Agent Router Running");
+  res.send("🚀 Stable async agent running");
 });
 
 /**
