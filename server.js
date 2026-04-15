@@ -25,27 +25,44 @@ const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, {
 
 /**
  * =========================
- * CONTEXT (ULTRA LIGHT)
+ * LIGHT CONTEXT (NO BLOQUEO)
  * =========================
  */
-const getContext = () => {
-  return `
+const getContext = () => `
 WORKDIR: ${process.cwd()}
 `;
+
+/**
+ * =========================
+ * CLEAN OUTPUT (CRITICAL)
+ * =========================
+ */
+const cleanLLMOutput = (text) => {
+  if (!text) return "";
+
+  return text
+    .replace(/INPUT:/g, "")
+    .replace(/CONTEXT:/g, "")
+    .replace(/```json/g, "")
+    .replace(/```/g, "")
+    .trim();
 };
 
 /**
  * =========================
- * SAFE JSON EXTRACTOR
+ * SAFE JSON EXTRACTION (LAST VALID)
  * =========================
  */
 const extractJSON = (text) => {
   if (!text) return null;
 
   try {
-    const match = text.match(/\{[\s\S]*\}/);
-    if (!match) return null;
-    return JSON.parse(match[0]);
+    const matches = text.match(/\{[\s\S]*?\}/g);
+    if (!matches || matches.length === 0) return null;
+
+    const last = matches[matches.length - 1];
+
+    return JSON.parse(last);
   } catch {
     return null;
   }
@@ -53,7 +70,7 @@ const extractJSON = (text) => {
 
 /**
  * =========================
- * ROUTER (INTENT CLASSIFIER)
+ * ROUTER
  * =========================
  */
 const routeLLM = async (input) => {
@@ -74,14 +91,11 @@ ${input}
     const res = await fetch(process.env.LLM_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        prompt,
-        temperature: 0.1
-      })
+      body: JSON.stringify({ prompt, temperature: 0.1 })
     });
 
     const data = await res.json();
-    const text = data.content || data.response || "";
+    const text = cleanLLMOutput(data.content || data.response || "");
 
     const parsed = extractJSON(text);
 
@@ -98,9 +112,15 @@ ${input}
  */
 const callLLM = async (input, context) => {
   const prompt = `
-You are a hybrid assistant.
+You are a strict assistant.
 
-Return ONLY JSON.
+Return ONLY ONE valid JSON object.
+
+DO NOT:
+- repeat INPUT
+- repeat CONTEXT
+- include explanations
+- include extra text
 
 FORMAT:
 {
@@ -130,20 +150,23 @@ ${context}
     });
 
     const data = await res.json();
-    const text = data.content || data.response || "";
 
-    const parsed = extractJSON(text);
+    const raw = cleanLLMOutput(data.content || data.response || "");
+
+    console.log("\n🧠 RAW:\n", raw);
+
+    const parsed = extractJSON(raw);
 
     if (!parsed) {
       return {
         type: "chat",
-        message: text || "no valid response",
+        message: raw || "invalid response",
         tool: null
       };
     }
 
     return parsed;
-  } catch {
+  } catch (err) {
     return {
       type: "chat",
       message: "LLM error",
@@ -154,7 +177,7 @@ ${context}
 
 /**
  * =========================
- * TOOL EXECUTOR (ASYNC SAFE)
+ * TOOL EXECUTION (NON BLOCKING)
  * =========================
  */
 const runTool = async (tool, chatId) => {
@@ -163,24 +186,18 @@ const runTool = async (tool, chatId) => {
   try {
     if (name === "shell") {
       if (DRY_RUN) return "[DRY RUN] shell skipped";
-
-      const { stdout } = await execAsync(input, {
-        timeout: 10000
-      });
-
+      const { stdout } = await execAsync(input, { timeout: 10000 });
       return stdout;
     }
 
     if (name === "claude") {
       if (DRY_RUN) return "[DRY RUN] claude skipped";
-
       await execAsync(`claude "${input}"`);
       return "claude executed";
     }
 
     if (name === "codex") {
       if (DRY_RUN) return "[DRY RUN] codex skipped";
-
       await execAsync(`codex "${input}"`);
       return "codex executed";
     }
@@ -190,9 +207,7 @@ const runTool = async (tool, chatId) => {
     }
 
     if (name === "telegram_send") {
-      if (chatId) {
-        await bot.sendMessage(chatId, input);
-      }
+      if (chatId) await bot.sendMessage(chatId, input);
       return "sent to telegram";
     }
 
@@ -211,27 +226,23 @@ const handleResponse = async (res, chatId) => {
   if (!res) return;
 
   if (res.type === "chat") {
-    if (chatId) {
-      await bot.sendMessage(chatId, res.message);
-    }
+    await bot.sendMessage(chatId, res.message);
     return;
   }
 
   if (res.type === "tool") {
     const output = await runTool(res.tool, chatId);
 
-    if (chatId) {
-      await bot.sendMessage(
-        chatId,
-        `🛠 ${res.tool.name}:\n\n${output}`
-      );
-    }
+    await bot.sendMessage(
+      chatId,
+      `🛠 ${res.tool.name}:\n\n${output}`
+    );
   }
 };
 
 /**
  * =========================
- * TELEGRAM ENTRYPOINT
+ * TELEGRAM ENTRY
  * =========================
  */
 bot.on("message", async (msg) => {
@@ -242,10 +253,9 @@ bot.on("message", async (msg) => {
 
   try {
     const route = await routeLLM(text);
+    const context = getContext();
 
     console.log("🧭 ROUTE:", route);
-
-    const context = getContext();
 
     if (route.intent === "chat") {
       const res = await callLLM(text, "chat mode");
@@ -254,7 +264,7 @@ bot.on("message", async (msg) => {
 
     if (route.intent === "plan") {
       const res = await callLLM(
-        "Generate plan only if explicitly needed: " + text,
+        "ONLY PLAN IF NEEDED: " + text,
         context
       );
       return await handleResponse(res, chatId);
@@ -267,17 +277,13 @@ bot.on("message", async (msg) => {
 
   } catch (err) {
     console.log("ERROR:", err.message);
-
-    await bot.sendMessage(
-      chatId,
-      "Error procesando solicitud"
-    );
+    await bot.sendMessage(chatId, "Error interno del agente");
   }
 });
 
 /**
  * =========================
- * EXPRESS API
+ * EXPRESS
  * =========================
  */
 app.post("/run", async (req, res) => {
@@ -286,7 +292,7 @@ app.post("/run", async (req, res) => {
 });
 
 app.get("/", (req, res) => {
-  res.send("🚀 Stable async agent running");
+  res.send("🚀 Stable LLM agent running");
 });
 
 /**
