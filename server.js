@@ -62,25 +62,48 @@ ${gitStatus || "clean"}
 
 /**
  * =========================
- * LLM CALL (HYBRID CHAT + TOOLS)
+ * SAFE JSON EXTRACTION
+ * =========================
+ */
+const extractJSON = (text) => {
+  if (!text) return null;
+
+  try {
+    const match = text.match(/\{[\s\S]*\}/);
+    if (!match) return null;
+
+    const cleaned = match[0]
+      .replace(/```json/g, "")
+      .replace(/```/g, "")
+      .trim();
+
+    return JSON.parse(cleaned);
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * =========================
+ * LLM CALL
  * =========================
  */
 const callLLM = async (input, context) => {
   const prompt = `
 You are a hybrid assistant.
 
-You can either:
-1. Chat normally
-2. Or use tools when needed
+You can:
+- respond normally (chat)
+- or use tools
 
-TOOLS AVAILABLE:
+TOOLS:
 - shell
 - claude
 - codex
 - db_query
 - telegram_send
 
-Return ONLY valid JSON.
+RETURN EXACTLY ONE JSON OBJECT.
 
 FORMAT:
 {
@@ -93,10 +116,10 @@ FORMAT:
 }
 
 RULES:
-- If no action needed → type chat
-- If action needed → type tool
-- No markdown
-- No explanation
+- ONLY ONE JSON OBJECT
+- NO explanations
+- NO multiple outputs
+- INVALID if duplicated
 
 INPUT:
 ${input}
@@ -120,16 +143,21 @@ ${context}
 
     console.log("\n🧠 RAW LLM:\n", text);
 
-    const cleaned = text
-      .replace(/```json/g, "")
-      .replace(/```/g, "")
-      .trim();
+    const parsed = extractJSON(text);
 
-    return JSON.parse(cleaned);
+    if (!parsed) {
+      return {
+        type: "chat",
+        message: text || "No valid JSON returned",
+        tool: null
+      };
+    }
+
+    return parsed;
   } catch (err) {
     return {
       type: "chat",
-      message: "LLM error or invalid response",
+      message: "LLM error",
       tool: null
     };
   }
@@ -149,24 +177,24 @@ const executeTool = async (tool, chatId) => {
 
   try {
     if (name === "shell") {
-      if (DRY_RUN) return output = "[DRY RUN] shell skipped";
+      if (DRY_RUN) return "[DRY RUN] shell skipped";
       output = execSync(input).toString();
     }
 
     if (name === "claude") {
-      if (DRY_RUN) return output = "[DRY RUN] claude skipped";
+      if (DRY_RUN) return "[DRY RUN] claude skipped";
       execSync(`claude "${input}"`, { stdio: "inherit" });
       output = "claude executed";
     }
 
     if (name === "codex") {
-      if (DRY_RUN) return output = "[DRY RUN] codex skipped";
+      if (DRY_RUN) return "[DRY RUN] codex skipped";
       execSync(`codex "${input}"`, { stdio: "inherit" });
       output = "codex executed";
     }
 
     if (name === "db_query") {
-      output = `DB placeholder: ${input}`;
+      output = `DB (mock): ${input}`;
     }
 
     if (name === "telegram_send") {
@@ -187,7 +215,7 @@ const executeTool = async (tool, chatId) => {
  * DISPATCHER
  * =========================
  */
-const handleLLMResponse = async (res, chatId) => {
+const handleResponse = async (res, chatId) => {
   if (!res) return;
 
   if (res.type === "chat") {
@@ -199,14 +227,17 @@ const handleLLMResponse = async (res, chatId) => {
     const output = await executeTool(res.tool, chatId);
 
     if (chatId) {
-      bot.sendMessage(chatId, `🛠 ${res.tool.name}:\n\n${output}`);
+      bot.sendMessage(
+        chatId,
+        `🛠 ${res.tool.name}:\n\n${output}`
+      );
     }
   }
 };
 
 /**
  * =========================
- * PIPELINE (PLAN MODE)
+ * PIPELINE MODE
  * =========================
  */
 const runPipeline = async (chatId = null) => {
@@ -221,7 +252,7 @@ const runPipeline = async (chatId = null) => {
 
     const res = await callLLM(task, context);
 
-    await handleLLMResponse(res, chatId);
+    await handleResponse(res, chatId);
   }
 
   console.log("\n✅ PIPELINE DONE");
@@ -229,7 +260,7 @@ const runPipeline = async (chatId = null) => {
 
 /**
  * =========================
- * TELEGRAM ENTRYPOINT
+ * TELEGRAM
  * =========================
  */
 bot.on("message", async (msg) => {
@@ -246,7 +277,7 @@ bot.on("message", async (msg) => {
   const context = getContext();
   const res = await callLLM(text, context);
 
-  await handleLLMResponse(res, chatId);
+  await handleResponse(res, chatId);
 });
 
 /**
@@ -260,7 +291,7 @@ app.post("/run", async (req, res) => {
 });
 
 app.get("/", (req, res) => {
-  res.send("🚀 Hybrid Agent Running");
+  res.send("🚀 Hybrid Agent Stable");
 });
 
 /**
